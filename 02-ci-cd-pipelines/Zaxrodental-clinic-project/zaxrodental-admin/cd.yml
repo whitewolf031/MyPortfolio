@@ -1,0 +1,254 @@
+name: CD
+
+# CI muvaffaqiyatli tugaganda ishlaydi (main -> production, dev -> development).
+# Stages: build (image + Trivy + Docker Hub push) -> prepare (.env + pull)
+#         -> deploy (run + health check, xato bo'lsa eski image'ga rollback) -> notify
+# Environment'lar: production (main) va development (dev). Har birida quyidagilar bo'lishi kerak:
+#   SERVER_HOST, SERVER_USER, DOCKERHUB_USERNAME, IMAGE_NAME, CONTAINER_NAME,
+#   VITE_API_URL, SSH_PRIVATE_KEY, DOCKERHUB_TOKEN (ixtiyoriy: DOCKER_NETWORK)
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'main' && 'production' || github.event_name == 'workflow_dispatch' && github.ref_name == 'main' && 'production' || 'development' }}
+    env:
+      DEPLOY_ENV: ${{ github.event.workflow_run.head_branch == 'main' && 'production' || github.event.workflow_run.head_branch == 'dev' && 'development' || github.ref_name == 'main' && 'production' || 'development' }}
+      SERVER_HOST: ${{ vars.SERVER_HOST }}
+      SERVER_USER: ${{ vars.SERVER_USER }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      CONTAINER: ${{ vars.CONTAINER_NAME }}
+      # NETWORK: ${{ vars.DOCKER_NETWORK }}
+    steps:
+      # Tag = qisqa commit sha (7 belgi), masalan 10449/zahrodent_admin:8d777fa
+      - name: Set image
+        run: echo "IMAGE=$IMAGE_NAME:${SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Check variables
+        run: |
+          missing=""
+          for k in SERVER_HOST SERVER_USER CONTAINER; do [ -z "${!k}" ] && missing="$missing $k"; done
+          [ -z "$IMAGE_NAME" ] && missing="$missing IMAGE_NAME"
+          if [ -n "$missing" ]; then echo "::error::$DEPLOY_ENV environment'da yo'q:$missing"; exit 1; fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Fix'i bor CRITICAL zaiflik bo'lsa to'xtaydi; HIGH va fix'siz — faqat log.
+      - name: Trivy scan
+        run: |
+          trivy() {
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+              aquasec/trivy:0.75.0 "$@"
+          }
+          trivy image --scanners vuln --no-progress --severity HIGH,CRITICAL --exit-code 0 "$IMAGE"
+          trivy image --scanners vuln --no-progress --skip-db-update --ignore-unfixed \
+            --severity CRITICAL --exit-code 1 "$IMAGE"
+
+      - name: Docker push
+        run: |
+          LATEST="${IMAGE%:*}:latest"
+          docker tag "$IMAGE" "$LATEST"
+          docker push "$IMAGE"
+          docker push "$LATEST"
+
+  prepare:
+    name: Prepare
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'main' && 'production' || github.event_name == 'workflow_dispatch' && github.ref_name == 'main' && 'production' || 'development' }}
+    env:
+      DEPLOY_ENV: ${{ github.event.workflow_run.head_branch == 'main' && 'production' || github.event.workflow_run.head_branch == 'dev' && 'development' || github.ref_name == 'main' && 'production' || 'development' }}
+      SERVER_HOST: ${{ vars.SERVER_HOST }}
+      SERVER_USER: ${{ vars.SERVER_USER }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      CONTAINER: ${{ vars.CONTAINER_NAME }}
+      # NETWORK: ${{ vars.DOCKER_NETWORK }}
+      ENV_FILE: /home/ubuntu/zahrodent_admin/.env
+    steps:
+      # Tag = qisqa commit sha (7 belgi), masalan 10449/zahrodent_admin:8d777fa
+      - name: Set image
+        run: echo "IMAGE=$IMAGE_NAME:${SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Create .env
+        env:
+          VITE_API_URL: ${{ vars.VITE_API_URL }}
+        run: |
+          umask 077
+          missing=""
+          for k in VITE_API_URL; do
+            [ -z "${!k}" ] && missing="$missing $k"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::$DEPLOY_ENV environment'da yo'q:$missing"
+            exit 1
+          fi
+          for k in VITE_API_URL; do
+            if [ -n "${!k}" ]; then printf '%s=%s\n' "$k" "${!k}"; fi
+          done > app.env
+          echo "$(wc -l < app.env) ta kalit yozildi"
+
+      - name: Setup SSH
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id
+          chmod 600 ~/.ssh/id
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host server\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/id\n' "$SERVER_HOST" "$SERVER_USER" > ~/.ssh/config
+
+      # Eski .env .env.bak sifatida saqlanadi (qo'lda qaytarish uchun).
+      - name: Upload .env
+        run: |
+          # shellcheck disable=SC2029 # ENV_FILE runner'da ochiladi (ataylab)
+          ssh server "set -e; umask 077; mkdir -p \"\$(dirname '$ENV_FILE')\"; if [ -f '$ENV_FILE' ]; then cp '$ENV_FILE' '$ENV_FILE.bak'; fi; cat > '$ENV_FILE'" < app.env
+          rm -f app.env
+
+      - name: Docker pull
+        run: |
+          # shellcheck disable=SC2029 # IMAGE runner'da ochiladi (ataylab)
+          ssh server "docker pull '$IMAGE'"
+
+  deploy:
+    name: Deploy
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'main' && 'production' || github.event_name == 'workflow_dispatch' && github.ref_name == 'main' && 'production' || 'development' }}
+    env:
+      DEPLOY_ENV: ${{ github.event.workflow_run.head_branch == 'main' && 'production' || github.event.workflow_run.head_branch == 'dev' && 'development' || github.ref_name == 'main' && 'production' || 'development' }}
+      SERVER_HOST: ${{ vars.SERVER_HOST }}
+      SERVER_USER: ${{ vars.SERVER_USER }}
+      IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      CONTAINER: ${{ vars.CONTAINER_NAME }}
+      # NETWORK: ${{ vars.DOCKER_NETWORK }}
+      ENV_FILE: /home/ubuntu/zahrodent_admin/.env
+    steps:
+      # Tag = qisqa commit sha (7 belgi), masalan 10449/zahrodent_admin:8d777fa
+      - name: Set image
+        run: echo "IMAGE=$IMAGE_NAME:${SHA::7}" >> "$GITHUB_ENV"
+
+      - name: Setup SSH
+        env:
+          SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id
+          chmod 600 ~/.ssh/id
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host server\n  HostName %s\n  User %s\n  IdentityFile ~/.ssh/id\n' "$SERVER_HOST" "$SERVER_USER" > ~/.ssh/config
+
+      # Health check o'tmasa oldingi image bilan container qayta ko'tariladi.
+      - name: Deploy
+        run: |
+          # shellcheck disable=SC2029 # qiymatlar runner'da ochiladi (ataylab)
+          ssh server "IMAGE='$IMAGE' CONTAINER='$CONTAINER' ENV_FILE='$ENV_FILE' NETWORK='${NETWORK:-}' bash -s" << 'EOF'
+            set -u
+            PREV=$(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)
+            echo "Oldingi image: ${PREV:-none}"
+            run() {
+              docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+              docker run -d --name "$CONTAINER" --restart unless-stopped \
+                ${NETWORK:+--network "$NETWORK"} \
+                -p 127.0.0.1:8071:8071 \
+                --env-file "$ENV_FILE" "$1" >/dev/null
+            }
+            healthy() {
+              for _ in $(seq 1 30); do
+                curl -fsS http://127.0.0.1:8071/ >/dev/null 2>&1 && return 0
+                sleep 3
+              done
+              return 1
+            }
+            run "$IMAGE"
+            if healthy; then echo "✅ Healthy: $IMAGE"; exit 0; fi
+            echo "❌ Health check failed"
+            docker logs --tail 100 "$CONTAINER"
+            if [ -n "$PREV" ]; then
+              echo "↩️ Rollback: $PREV"
+              [ -f "$ENV_FILE.bak" ] && cp "$ENV_FILE.bak" "$ENV_FILE"
+              run "$PREV"
+              healthy && echo "Rollback healthy" || echo "Rollback ham ishlamadi!"
+            fi
+            exit 1
+          EOF
+
+      - name: Cleanup
+        run: ssh server 'docker image prune -af --filter "until=168h" >/dev/null || true'
+
+  notify:
+    name: Notify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    environment: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'main' && 'production' || github.event_name == 'workflow_dispatch' && github.ref_name == 'main' && 'production' || 'development' }}
+    needs: [build, prepare, deploy]
+    if: always() && needs.build.result != 'skipped'
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      # Every value goes through env, never ${{ }} inside run: (script injection).
+      - name: Send Telegram message
+        env:
+          BOT_TOKEN: ${{ secrets.PR_TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ vars.PR_DEV_GROUP_ID }}
+          TOPIC_ID: ${{ vars.PR_TOPIC_ID }}
+          WORKFLOW: CD
+          BUILD: ${{ needs.build.result }}
+          PREPARE: ${{ needs.prepare.result }}
+          DEPLOY: ${{ needs.deploy.result }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          ACTOR: ${{ github.event.workflow_run.actor.login || github.actor }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_MSG: ${{ github.event.workflow_run.head_commit.message || 'manual deploy' }}
+          COMMIT_URL: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.event.workflow_run.head_sha || github.sha }}
+        run: bash .github/script/notify-telegram.sh

@@ -1,1 +1,1 @@
-RaBola o'quvmarkazi lms loyihasi uchun qilingan avtomatlashtirish ishlarim
+# RaBola o'quvmarkazi loyihasi uchun qilingan Dockerfile va docker-compose ishlarim
