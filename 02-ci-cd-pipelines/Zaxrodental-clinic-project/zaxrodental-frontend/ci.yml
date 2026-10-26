@@ -1,0 +1,129 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      # TODO: lock fayl package.json bilan mos emas (sharp yo'q) va vite-imagetools@10
+      # vite>=7 talab qiladi (loyihada vite@5). Tuzatilgach yana `npm ci`ga qaytarilsin.
+      - run: npm install --legacy-peer-deps --no-audit --no-fund
+      - run: npx eslint src --max-warnings=9999
+
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      # TODO: lock fayl package.json bilan mos emas (sharp yo'q) va vite-imagetools@10
+      # vite>=7 talab qiladi (loyihada vite@5). Tuzatilgach yana `npm ci`ga qaytarilsin.
+      - run: npm install --legacy-peer-deps --no-audit --no-fund
+      - run: npx tsc --noEmit -p tsconfig.app.json
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      # TODO: lock fayl package.json bilan mos emas (sharp yo'q) va vite-imagetools@10
+      # vite>=7 talab qiladi (loyihada vite@5). Tuzatilgach yana `npm ci`ga qaytarilsin.
+      - run: npm install --legacy-peer-deps --no-audit --no-fund
+      - run: npm test
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # git describe tag'larni ko'rishi uchun to'liq tarix kerak
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      # TODO: lock fayl package.json bilan mos emas (sharp yo'q) va vite-imagetools@10
+      # vite>=7 talab qiladi (loyihada vite@5). Tuzatilgach yana `npm ci`ga qaytarilsin.
+      - run: npm install --legacy-peer-deps --no-audit --no-fund
+      # PR'da github.sha — merge commit; haqiqiy commit uchun head sha olinadi.
+      - name: Set build info
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          echo "VERSION=$(git describe --tags --always "$HEAD_SHA")" >> "$GITHUB_ENV"
+          echo "COMMIT=${HEAD_SHA::7}" >> "$GITHUB_ENV"
+      - run: npm run build
+      - name: Write version.json
+        run: printf '{"version":"%s","commit":"%s"}\n' "$VERSION" "$COMMIT" > dist/version.json
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+          retention-days: 7
+
+  notify:
+    name: Notify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    # PR'da base branch (main/dev), push va dispatch'da joriy branch bo'yicha tanlanadi.
+    environment: ${{ (github.base_ref || github.ref_name) == 'main' && 'production' || 'development' }}
+    needs: [lint, typecheck, test, build]
+    if: always()
+    # Telegram xatosi CI'ni qizil qilmasin — aks holda CD (workflow_run success) skip bo'ladi.
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      # Every value goes through env, never ${{ }} inside run: (script injection).
+      - name: Send Telegram message
+        env:
+          BOT_TOKEN: ${{ secrets.PR_TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ vars.PR_DEV_GROUP_ID }}
+          TOPIC_ID: ${{ vars.PR_TOPIC_ID }}
+          LINT: ${{ needs.lint.result }}
+          TYPECHECK: ${{ needs.typecheck.result }}
+          TEST: ${{ needs.test.result }}
+          BUILD: ${{ needs.build.result }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMIT_MSG: ${{ github.event.head_commit.message || github.event.pull_request.title }}
+          COMMIT_URL: ${{ github.event.head_commit.url || github.event.pull_request.html_url }}
+        run: bash .github/script/notify-telegram.sh 

@@ -1,0 +1,55 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: itech_postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${PGUSER:-${USER:-postgres}}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-${PASSWORD:-123456}}
+      POSTGRES_DB: ${PGDATABASE:-${DATABASE:-webcervice}}
+    ports:
+      - mode: ingress
+        target: 5432
+        published: "5433"
+        protocol: tcp
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-${USER:-postgres}} -d ${PGDATABASE:-${DATABASE:-webcervice}}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks:
+      - itech_network
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: itech_bot
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      - PGHOST=db
+      - HOST=db
+      - DB_HOST=db
+      - PGPORT=${DB_PORT:-5432}
+      - PGUSER=${PGUSER:-${USER:-postgres}}
+      - PGPASSWORD=${PGPASSWORD:-${PASSWORD:-123456}}
+      - PGDATABASE=${PGDATABASE:-${DATABASE:-webcervice}}
+    volumes:
+      - .:/app
+    networks:
+      - itech_network
+
+networks:
+  itech_network:
+    driver: bridge
+
+volumes:
+  pgdata:
