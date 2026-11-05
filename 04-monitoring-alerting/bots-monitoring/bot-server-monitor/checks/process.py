@@ -1,3 +1,5 @@
+import subprocess
+
 import psutil
 
 
@@ -39,6 +41,41 @@ def get_top_memory_processes(limit=5):
 
 
 def get_top_cpu_processes(limit=5):
+    # Linux muhitida ps buyrug'i CPU foizini darhol va aniq hisoblab beradi
+    try:
+        res = subprocess.run(
+            ["ps", "-eo", "pid,comm,%cpu", "--sort=-%cpu"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if res.returncode == 0:
+            processes = []
+            lines = res.stdout.strip().splitlines()
+            for line in lines[1:]:
+                parts = line.strip().split(None, 2)
+                if len(parts) == 3:
+                    try:
+                        pid = int(parts[0])
+                        name = parts[1]
+                        cpu_pct = float(parts[2])
+                        processes.append(
+                            {
+                                "pid": pid,
+                                "name": name,
+                                "cpu_percent": cpu_pct,
+                            }
+                        )
+                        if len(processes) >= limit:
+                            break
+                    except ValueError:
+                        continue
+            if processes:
+                return processes
+    except Exception:
+        pass
+
     processes = []
 
     for process in psutil.process_iter(

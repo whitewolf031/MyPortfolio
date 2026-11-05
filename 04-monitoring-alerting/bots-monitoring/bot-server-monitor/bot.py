@@ -12,8 +12,14 @@ from telegram.ext import (
 from config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_GROUP_ID,
+    SERVER_TOPIC_ID,
+    CLEANUP_TOPIC_ID,
+    RAM_CRITICAL,
+    DISK_CRITICAL,
+    CPU_CRITICAL,
     REPORT_INTERVAL_HOURS,
     ALERT_CHECK_INTERVAL_SECONDS,
+    CLEANUP_INTERVAL_DAYS,
 )
 
 from monitor import (
@@ -38,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 ram_alert_active = False
 disk_alert_active = False
+cpu_alert_active = False
 
 
 def format_bytes(value):
@@ -60,9 +67,27 @@ def format_bytes(value):
     return f"{size:.1f} PB"
 
 
+async def send_to_telegram(
+    bot,
+    text: str,
+    topic_id: int | None = None,
+    chat_id: str | int = TELEGRAM_GROUP_ID,
+):
+    kwargs = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": ParseMode.HTML,
+    }
+    if topic_id is not None:
+        kwargs["message_thread_id"] = topic_id
+
+    return await bot.send_message(**kwargs)
+
+
 def format_status(status):
     memory = status["memory"]
     disk = status["disk"]
+    cpu = status.get("cpu")
 
     message = [
         "🖥 <b>SERVER STATUS</b>",
@@ -77,16 +102,40 @@ def format_status(status):
         f"Usage: {memory['percent']:.1f}%",
         f"Available: {format_bytes(memory['available'])}",
         "",
-        "💾 <b>DISK</b>",
+        "💾 <b>SSD / DISK</b>",
         (
             f"Used: {format_bytes(disk['used'])} / "
             f"{format_bytes(disk['total'])}"
         ),
         f"Usage: {disk['percent']:.1f}%",
         f"Free: {format_bytes(disk['free'])}",
-        "",
-        "🔥 <b>TOP RAM PROCESSES</b>",
     ]
+
+    if cpu:
+        message.extend(
+            [
+                "",
+                "⚙️ <b>CPU</b>",
+                f"Usage: {cpu['percent']:.1f}%",
+                (
+                    f"Cores: {cpu['logical_cores']} "
+                    f"({cpu['physical_cores']} physical)"
+                ),
+                (
+                    f"Load Avg (1m, 5m, 15m): "
+                    f"{cpu['load_1m']:.2f}, "
+                    f"{cpu['load_5m']:.2f}, "
+                    f"{cpu['load_15m']:.2f}"
+                ),
+            ]
+        )
+
+    message.extend(
+        [
+            "",
+            "🔥 <b>TOP RAM PROCESSES</b>",
+        ]
+    )
 
     for index, process in enumerate(
         status["processes"],
@@ -185,7 +234,7 @@ def format_disk(status):
     disk = status["disk"]
 
     message = [
-        "💾 <b>DISK STATUS</b>",
+        "💾 <b>SSD / DISK STATUS</b>",
         "",
         f"Total: {format_bytes(disk['total'])}",
         f"Used: {format_bytes(disk['used'])}",
@@ -204,16 +253,56 @@ def format_disk(status):
     return "\n".join(message)
 
 
+def format_cpu(status):
+    cpu = status["cpu"]
+    cpu_processes = status.get("cpu_processes", [])
+
+    message = [
+        "⚙️ <b>CPU STATUS</b>",
+        "",
+        f"Usage: {cpu['percent']:.1f}%",
+        f"Logical Cores: {cpu['logical_cores']}",
+        f"Physical Cores: {cpu['physical_cores']}",
+        (
+            f"Load Avg (1m, 5m, 15m): "
+            f"{cpu['load_1m']:.2f}, "
+            f"{cpu['load_5m']:.2f}, "
+            f"{cpu['load_15m']:.2f}"
+        ),
+    ]
+
+    if cpu.get("freq") and cpu["freq"].get("current"):
+        message.append(
+            f"Frequency: {cpu['freq']['current']:.0f} MHz"
+        )
+
+    if cpu_processes:
+        message.extend(
+            [
+                "",
+                "⚡ <b>TOP CPU PROCESSES</b>",
+            ]
+        )
+        for index, process in enumerate(cpu_processes, start=1):
+            message.append(
+                f"{index}. {process['name']} "
+                f"(<code>{process['pid']}</code>) — "
+                f"{process['cpu_percent']:.1f}%"
+            )
+
+    return "\n".join(message)
+
+
 async def startup_message(
     application: Application,
 ):
-    await application.bot.send_message(
-        chat_id=TELEGRAM_GROUP_ID,
+    await send_to_telegram(
+        application.bot,
         text=(
-            "🚀 <b>server-monitoring bot</b> "
-            "ishga tushdi."
+            "🚀 <b>server-monitoring bot</b> ishga tushdi.\n"
+            f"Server: <code>{socket.gethostname()}</code>"
         ),
-        parse_mode=ParseMode.HTML,
+        topic_id=SERVER_TOPIC_ID,
     )
 
 
@@ -225,10 +314,13 @@ async def start_handler(
         return
 
     await update.message.reply_text(
-        "🤖 <b>Server Monitor</b>\n\n"
-        "/status - server holati\n"
-        "/ram - RAM holati\n"
-        "/disk - Disk holati",
+        "🤖 <b>Server Monitor Bot</b>\n\n"
+        "Mavjud buyruqlar:\n"
+        "/status - Server umumiy holati (RAM, SSD, CPU)\n"
+        "/ram - RAM xotira holati\n"
+        "/cpu - CPU protsessor holati\n"
+        "/disk - SSD / Disk holati\n"
+        "/cleanup - 5 kunlik tozalashni bajarish",
         parse_mode=ParseMode.HTML,
     )
 
@@ -278,20 +370,66 @@ async def disk_handler(
     )
 
 
+async def cpu_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if update.message is None:
+        return
+
+    status = get_server_status()
+
+    await update.message.reply_text(
+        format_cpu(status),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cleanup_command_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if update.message is None:
+        return
+
+    wait_msg = await update.message.reply_text(
+        "🧹 <b>Server tozalash boshlandi (5 kunlik)...</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    returncode, output = await run_cleanup()
+
+    # Telegram xabar limiti (4096 belgi) oshib ketmasligi uchun
+    safe_output = output[-3500:] if len(output) > 3500 else output
+
+    if returncode == 0:
+        header = "🧹 <b>SERVER TOZALANDI (5 KUNLIK)</b>\n\n"
+    else:
+        header = "⚠️ <b>TOZALASHDA XATOLIK</b>\n\n"
+
+    message = f"{header}<pre>{safe_output}</pre>"
+
+    await wait_msg.edit_text(
+        message,
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def send_report(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     try:
         status = get_server_status()
 
-        await context.bot.send_message(
-            chat_id=TELEGRAM_GROUP_ID,
+        await send_to_telegram(
+            context.bot,
             text=format_status(status),
-            parse_mode=ParseMode.HTML,
+            topic_id=SERVER_TOPIC_ID,
         )
 
         logger.info(
-            "4-hour server report sent"
+            "Server report sent to topic %s",
+            SERVER_TOPIC_ID,
         )
 
     except Exception:
@@ -305,10 +443,10 @@ async def check_server_alerts(
 ):
     global ram_alert_active
     global disk_alert_active
+    global cpu_alert_active
 
     try:
         status = get_critical_metrics()
-
         alerts = check_alerts(status)
 
         ram_critical = any(
@@ -321,19 +459,24 @@ async def check_server_alerts(
             for alert in alerts
         )
 
+        cpu_critical = any(
+            alert["type"] == "CPU_CRITICAL"
+            for alert in alerts
+        )
+
+        # --- RAM ALERT ---
         if ram_critical and not ram_alert_active:
             memory = status["memory"]
+            detailed_status = get_server_status()
 
             message = (
                 "🚨 <b>RAM CRITICAL</b>\n\n"
                 f"Usage: {memory['percent']:.1f}%\n"
                 f"Used: {format_bytes(memory['used'])}\n"
-                f"Total: {format_bytes(memory['total'])}\n\n"
+                f"Total: {format_bytes(memory['total'])}\n"
+                f"Limit: {RAM_CRITICAL}%\n\n"
                 "🔥 <b>TOP RAM PROCESSES</b>\n"
             )
-
-            # Critical holatda processlarni ham ko'rsatish
-            detailed_status = get_server_status()
 
             for process in detailed_status["processes"]:
                 message += (
@@ -341,88 +484,151 @@ async def check_server_alerts(
                     f"{process['memory_mb']:.1f} MB\n"
                 )
 
-            await context.bot.send_message(
-                chat_id=TELEGRAM_GROUP_ID,
+            await send_to_telegram(
+                context.bot,
                 text=message,
-                parse_mode=ParseMode.HTML,
+                topic_id=SERVER_TOPIC_ID,
             )
 
             ram_alert_active = True
-
-            logger.warning(
-                "RAM critical alert sent"
-            )
+            logger.warning("RAM critical alert sent")
 
         if not ram_critical and ram_alert_active:
-            await context.bot.send_message(
-                chat_id=TELEGRAM_GROUP_ID,
+            await send_to_telegram(
+                context.bot,
                 text=(
                     "✅ <b>RAM RECOVERED</b>\n\n"
                     "RAM usage critical holatdan qaytdi."
                 ),
-                parse_mode=ParseMode.HTML,
+                topic_id=SERVER_TOPIC_ID,
             )
 
             ram_alert_active = False
+            logger.info("RAM recovered")
 
-            logger.info(
-                "RAM recovered"
-            )
-
+        # --- DISK ALERT ---
         if disk_critical and not disk_alert_active:
             disk = status["disk"]
-
             detailed_status = get_server_status()
 
             message = (
                 "🚨 <b>DISK CRITICAL</b>\n\n"
                 f"Usage: {disk['percent']:.1f}%\n"
                 f"Used: {format_bytes(disk['used'])}\n"
-                f"Free: {format_bytes(disk['free'])}\n\n"
+                f"Free: {format_bytes(disk['free'])}\n"
+                f"Limit: {DISK_CRITICAL}%\n\n"
                 "📁 <b>LARGEST DIRECTORIES</b>\n"
             )
 
-            for path, size in (
-                detailed_status[
-                    "largest_directories"
-                ]
-            ):
+            for path, size in detailed_status["largest_directories"]:
                 message += (
                     f"<code>{path}</code> — "
                     f"{format_bytes(size)}\n"
                 )
 
-            await context.bot.send_message(
-                chat_id=TELEGRAM_GROUP_ID,
+            await send_to_telegram(
+                context.bot,
                 text=message,
-                parse_mode=ParseMode.HTML,
+                topic_id=SERVER_TOPIC_ID,
             )
 
             disk_alert_active = True
-
-            logger.warning(
-                "Disk critical alert sent"
-            )
+            logger.warning("Disk critical alert sent")
 
         if not disk_critical and disk_alert_active:
-            await context.bot.send_message(
-                chat_id=TELEGRAM_GROUP_ID,
+            await send_to_telegram(
+                context.bot,
                 text=(
                     "✅ <b>DISK RECOVERED</b>\n\n"
                     "Disk usage critical holatdan qaytdi."
                 ),
-                parse_mode=ParseMode.HTML,
+                topic_id=SERVER_TOPIC_ID,
             )
 
             disk_alert_active = False
+            logger.info("Disk recovered")
 
-            logger.info(
-                "Disk recovered"
+        # --- CPU ALERT ---
+        if cpu_critical and not cpu_alert_active:
+            cpu = status["cpu"]
+            detailed_status = get_server_status()
+
+            message = (
+                "🚨 <b>CPU CRITICAL</b>\n\n"
+                f"Usage: {cpu['percent']:.1f}%\n"
+                f"Limit: {CPU_CRITICAL}%\n"
+                f"Load Avg: {cpu['load_1m']:.2f}, {cpu['load_5m']:.2f}, {cpu['load_15m']:.2f}\n\n"
+                "⚡ <b>TOP CPU PROCESSES</b>\n"
             )
+
+            for process in detailed_status["cpu_processes"]:
+                message += (
+                    f"{process['name']} (PID: {process['pid']}) — "
+                    f"{process['cpu_percent']:.1f}%\n"
+                )
+
+            await send_to_telegram(
+                context.bot,
+                text=message,
+                topic_id=SERVER_TOPIC_ID,
+            )
+
+            cpu_alert_active = True
+            logger.warning("CPU critical alert sent")
+
+        if not cpu_critical and cpu_alert_active:
+            await send_to_telegram(
+                context.bot,
+                text=(
+                    "✅ <b>CPU RECOVERED</b>\n\n"
+                    "CPU usage critical holatdan qaytdi."
+                ),
+                topic_id=SERVER_TOPIC_ID,
+            )
+
+            cpu_alert_active = False
+            logger.info("CPU recovered")
 
     except Exception:
         logger.exception(
             "Failed to check server alerts"
+        )
+
+
+async def send_cleanup_report(
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    try:
+        returncode, output = await run_cleanup()
+
+        # Telegram xabar limiti (4096 belgi) oshib ketmasligi uchun
+        safe_output = output[-3500:] if len(output) > 3500 else output
+
+        if returncode == 0:
+            message = (
+                "🧹 <b>SERVER CLEANUP (5 KUNLIK)</b>\n\n"
+                f"<pre>{safe_output}</pre>"
+            )
+        else:
+            message = (
+                "⚠️ <b>CLEANUP FAILED</b>\n\n"
+                f"<pre>{safe_output}</pre>"
+            )
+
+        await send_to_telegram(
+            context.bot,
+            text=message,
+            topic_id=CLEANUP_TOPIC_ID,
+        )
+
+        logger.info(
+            "Cleanup report sent to topic %s",
+            CLEANUP_TOPIC_ID,
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to run cleanup"
         )
 
 
@@ -472,6 +678,34 @@ def main():
         )
     )
 
+    application.add_handler(
+        CommandHandler(
+            "ssd",
+            disk_handler,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "cpu",
+            cpu_handler,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "cleanup",
+            cleanup_command_handler,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "clean",
+            cleanup_command_handler,
+        )
+    )
+
     application.add_error_handler(
         error_handler
     )
@@ -492,7 +726,7 @@ def main():
 
     application.job_queue.run_repeating(
         send_cleanup_report,
-        interval=2 * 24 * 60 * 60,
+        interval=CLEANUP_INTERVAL_DAYS * 24 * 60 * 60,
         first=60,
         name="server-cleanup",
     )
@@ -503,37 +737,6 @@ def main():
 
     application.run_polling()
 
-async def send_cleanup_report(
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    try:
-        returncode, output = await run_cleanup()
-
-        if returncode == 0:
-            message = (
-                "🧹 <b>SERVER CLEANUP</b>\n\n"
-                f"<pre>{output}</pre>"
-            )
-        else:
-            message = (
-                "❌ <b>CLEANUP FAILED</b>\n\n"
-                f"<pre>{output}</pre>"
-            )
-
-        await context.bot.send_message(
-            chat_id=TELEGRAM_GROUP_ID,
-            text=message,
-            parse_mode=ParseMode.HTML,
-        )
-
-        logger.info(
-            "Cleanup report sent"
-        )
-
-    except Exception:
-        logger.exception(
-            "Failed to run cleanup"
-        )
 
 if __name__ == "__main__":
     main()
