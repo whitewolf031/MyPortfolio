@@ -3,6 +3,7 @@ from checks.disk import (
     get_disk,
     get_largest_directories,
 )
+from checks.cpu import get_cpu
 from checks.process import (
     get_top_memory_processes,
     get_top_cpu_processes,
@@ -13,6 +14,7 @@ from checks.logs import get_logs
 from config import (
     RAM_CRITICAL,
     DISK_CRITICAL,
+    CPU_CRITICAL,
 )
 
 
@@ -20,12 +22,14 @@ def get_critical_metrics():
     return {
         "memory": get_memory(),
         "disk": get_disk(),
+        "cpu": get_cpu(),
     }
 
 
 def get_server_status():
     memory = get_memory()
     disk = get_disk()
+    cpu = get_cpu()
 
     processes = get_top_memory_processes()
     cpu_processes = get_top_cpu_processes()
@@ -41,6 +45,7 @@ def get_server_status():
     return {
         "memory": memory,
         "disk": disk,
+        "cpu": cpu,
         "processes": processes,
         "cpu_processes": cpu_processes,
         "docker": docker,
@@ -54,6 +59,7 @@ def check_alerts(status):
 
     memory_percent = status["memory"]["percent"]
     disk_percent = status["disk"]["percent"]
+    cpu_percent = status["cpu"]["percent"]
 
     if memory_percent >= RAM_CRITICAL:
         alerts.append(
@@ -70,6 +76,15 @@ def check_alerts(status):
                 "type": "DISK_CRITICAL",
                 "value": disk_percent,
                 "threshold": DISK_CRITICAL,
+            }
+        )
+
+    if cpu_percent >= CPU_CRITICAL:
+        alerts.append(
+            {
+                "type": "CPU_CRITICAL",
+                "value": cpu_percent,
+                "threshold": CPU_CRITICAL,
             }
         )
 
