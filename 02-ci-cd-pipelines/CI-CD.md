@@ -1,22 +1,326 @@
-# .github — qatorma-qator tushuntirish
+# .github — CI/CD avtomatlashtirish: to'liq qo'llanma
 
-Bu hujjat `.github/` ichidagi **har bir fayl va har bir muhim qator** nima qilishini tushuntiradi, shunda keyinchalik o'zingiz o'zgartira olasiz. Qator raqamlari ZIP'dagi fayllarga mos (`cd.yml` va `notify-telegram.sh` uchun **backend varianti** olingan).
+Bu papka loyihaning **barcha avtomatlashtirishini** o'z ichiga oladi: kodni tekshirish (CI), serverga joylashtirish (CD), kutubxonalarni yangilash, PR shabloni va Telegram xabarnomalari.
+
+Maqsad: dasturchi kodni `git push` / PR qilishi bilan **tekshiruv, build, xavfsizlik skaneri, deploy va xabarnoma** hammasi odam aralashuvisiz bajarilsin.
+
+Hujjat ikki qismdan iborat: **I qism** (1-10) umumiy tushuncha, arxitektura va sozlash; **II qism** (11-19) har bir fayl va har bir muhim qatorning tushuntirishi, shunda keyin o'zingiz o'zgartira olasiz.
 
 ## Mundarija
 
-0. [Avval shularni bilib oling (lug'at)](#0-avval-shularni-bilib-oling-lugat)
-1. [dependabot.yml](#1-dependabotyml)
-2. [pull_request_template.md](#2-pull_request_templatemd)
-3. [workflows/ci.yml](#3-workflowsciyml)
-4. [workflows/cd.yml](#4-workflowscdyml)
-5. [workflows/pr-telegram-notify.yml](#5-workflowspr-telegram-notifyyml)
-6. [script/notify-telegram.sh](#6-scriptnotify-telegramsh)
-7. [script/notify-pr-telegram.py](#7-scriptnotify-pr-telegrampy)
-8. [Nimani qayerda o'zgartirish (retseptlar)](#8-nimani-qayerda-ozgartirish-retseptlar)
+**I qism: umumiy**
+
+1. [Imkoniyatlar](#1-imkoniyatlar)
+2. [Arxitektura](#2-arxitektura)
+3. [Papka tuzilmasi](#3-papka-tuzilmasi)
+4. [**Kerakli environment'lar (Variables va Secrets)**](#4-kerakli-environmentlar-variables-va-secrets)
+   - [Environment qanday yaratiladi](#environment-qanday-yaratiladi)
+   - [4.1 Variables](#41-variables-maxfiy-emas-qiymati-korinadi)
+   - [4.2 Secrets](#42-secrets-maxfiy-logda--bolib-chiqadi)
+   - [4.3 GitHub o'zi beradigan qiymatlar](#43-kiritish-shart-emas-github-ozi-beradi)
+   - [4.4 Qiymatlarni qayerdan olish](#44-qiymatlarni-qayerdan-olish)
+   - [4.5 Muhim eslatmalar](#45-muhim-eslatmalar)
+5. [Kundalik ish tartibi](#5-kundalik-ish-tartibi)
+6. [Lokal sinash](#6-lokal-sinash)
+7. [Xavfsizlik qoidalari](#7-xavfsizlik-qoidalari)
+8. [Yangi loyihaga ko'chirish](#8-yangi-loyihaga-kochirish)
+9. [Muammolarni hal qilish](#9-muammolarni-hal-qilish)
+10. [Ma'lum cheklovlar](#10-malum-cheklovlar)
+
+**II qism: qatorma-qator tushuntirish**
+
+11. [Avval shularni bilib oling (lug'at)](#11-avval-shularni-bilib-oling-lugat)
+12. [dependabot.yml](#12-dependabotyml)
+13. [pull_request_template.md](#13-pull_request_templatemd)
+14. [workflows/ci.yml](#14-workflowsciyml)
+15. [workflows/cd.yml](#15-workflowscdyml)
+16. [workflows/pr-telegram-notify.yml](#16-workflowspr-telegram-notifyyml)
+17. [script/notify-telegram.sh](#17-scriptnotify-telegramsh)
+18. [script/notify-pr-telegram.py](#18-scriptnotify-pr-telegrampy)
+19. [Nimani qayerda o'zgartirish (retseptlar)](#19-nimani-qayerda-ozgartirish-retseptlar)
 
 ---
 
-## 0. Avval shularni bilib oling (lug'at)
+## 1. Imkoniyatlar
+
+| Imkoniyat | Qanday amalga oshadi |
+|---|---|
+| **Avtomatik tekshiruv** | Har PR va push'da `lint`, `typecheck`, `test` parallel ishlaydi |
+| **Docker build tekshiruvi** | PR'da image yig'iladi (push qilinmaydi), Dockerfile buzilmaganini bilasiz |
+| **Xavfsizlik skaneri** | Trivy image'dagi zaifliklarni qidiradi; tuzatilgan CRITICAL topilsa deploy to'xtaydi |
+| **Avtomatik deploy** | CI yashil bo'lgach image yig'iladi, Docker Hub'ga yuboriladi va serverda ishga tushadi |
+| **Rollback** | Yangi versiya health check'dan o'tmasa, avtomatik eski image va eski `.env` qaytadi |
+| **Versiyalash** | Har image `:<commit-sha-7-belgi>` tegiga ega (+ `:latest`), qaysi kod ishlayotgani aniq |
+| **Environment ajratish** | `main` → `production` environment (kengaytirilsa `dev` → `development`) |
+| **Telegram xabarnomalari** | Yangi PR, CI natijasi va deploy natijasi dev guruhiga keladi, xato bo'lsa log bilan |
+| **Avtomatik yangilanish** | Dependabot eskirgan paketlar va action'lar uchun PR ochadi |
+| **Bir xil PR sifati** | PR shabloni tavsif va tekshiruv ro'yxatini majbur qiladi |
+| **Qo'lda ishga tushirish** | CI va CD'ni `workflow_dispatch` bilan qo'lda ham ishga tushirish mumkin |
+
+---
+
+## 2. Arxitektura
+
+### Umumiy oqim
+
+```mermaid
+flowchart TD
+    DEV[Dasturchi] -->|PR ochadi| PR[Pull Request]
+    DEV -->|merge / push main| PUSH[Push main]
+
+    PR --> PRN[pr-telegram-notify.yml<br/>PR haqida Telegram xabari]
+    PR --> CI
+
+    PUSH --> CI
+
+    subgraph CI [ci.yml — tekshiruv]
+        L[Lint] 
+        T[Typecheck + build]
+        TS[Test]
+        DB[Docker build<br/>faqat PR]
+        L --> N1
+        T --> N1
+        TS --> N1
+        DB --> N1[Notify Telegram]
+    end
+
+    CI -->|push + success| CD
+
+    subgraph CD [cd.yml — deploy]
+        B[Build<br/>image + Trivy + push] --> P[Prepare<br/>.env + docker pull]
+        P --> D[Deploy<br/>run + health check]
+        D -->|healthy| OK[Tayyor]
+        D -->|xato| RB[Rollback: eski image]
+        D --> N2[Notify Telegram]
+    end
+
+    B -.->|push| HUB[(Docker Hub)]
+    P -.->|SSH| SRV[(Server)]
+    HUB -.->|pull| SRV
+    D -.->|SSH| SRV
+```
+
+### Qatlamlar
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│ 1. Trigger qatlami   push · pull_request · workflow_run ·     │
+│                      workflow_dispatch                        │
+├───────────────────────────────────────────────────────────────┤
+│ 2. Workflow qatlami  ci.yml · cd.yml · pr-telegram-notify.yml │
+├───────────────────────────────────────────────────────────────┤
+│ 3. Skript qatlami    notify-telegram.sh · notify-pr-telegram.py│
+├───────────────────────────────────────────────────────────────┤
+│ 4. Tashqi tizimlar   Docker Hub · SSH server · Telegram Bot   │
+│                      API · GitHub API · Trivy                 │
+├───────────────────────────────────────────────────────────────┤
+│ 5. Konfiguratsiya    GitHub Environments (Variables + Secrets)│
+└───────────────────────────────────────────────────────────────┘
+```
+
+### Asosiy dizayn qarorlari
+
+- **CI va CD ajratilgan.** CD faqat `workflow_run` orqali, ya'ni CI **muvaffaqiyatli** tugagandan keyin ishga tushadi. Tekshiruvdan o'tmagan kod hech qachon deploy bo'lmaydi.
+- **Bitta skript, ko'p repo.** `notify-telegram.sh` berilmagan bosqichlarni (Lint, Test va h.k.) xabarga kiritmaydi, shu sabab frontend, backend va boshqa repolarda o'zgarishsiz ishlaydi.
+- **Build, prepare, deploy alohida joblar.** Qaysi bosqichda yiqilgani darhol ko'rinadi, Telegram xabarida ham har bosqich alohida ✅/❌ bilan chiqadi.
+- **Xavfsiz rollback.** Deploy oldin ishlayotgan image nomini eslab qoladi, yangisi `healthy` bo'lmasa o'shanga qaytadi.
+
+---
+
+## 3. Papka tuzilmasi
+
+```
+.github/
+├── README.md                    ← shu hujjat
+├── dependabot.yml               ← kutubxonalarni avtomatik yangilash sozlamasi
+├── pull_request_template.md     ← har yangi PR'ning boshlang'ich matni
+│
+├── workflows/                   ← GitHub Actions workflow'lari (GitHub o'zi o'qiydi)
+│   ├── ci.yml                   ← tekshiruv: lint, typecheck, test, docker build
+│   ├── cd.yml                   ← deploy: build → prepare → deploy → notify
+│   └── pr-telegram-notify.yml   ← PR ochilganda Telegram xabari
+│
+└── script/                      ← workflow'lar chaqiradigan yordamchi skriptlar
+    ├── notify-telegram.sh       ← CI/CD natijasini Telegramga yuboradi (bash)
+    └── notify-pr-telegram.py    ← PR tavsifini Telegramga yuboradi (python)
+```
+
+| Yo'l | Kim o'qiydi | Vazifasi |
+|---|---|---|
+| `.github/` | GitHub | Maxsus papka: shu yerdagi ayrim fayllar avtomatik taniladi |
+| `workflows/*.yml` | GitHub Actions | Har bir fayl alohida avtomatlashtirish jarayoni |
+| `dependabot.yml` | Dependabot | Qaysi paketlar, qachon, qanday yangilansin |
+| `pull_request_template.md` | GitHub UI | PR ochilganda tavsif maydonini to'ldirib beradi |
+| `script/` | Workflow'lar | GitHub bu papkani o'zi ishlatmaydi; `bash .github/script/...` deb chaqiriladi |
+
+---
+
+Har bir faylning **qatorma-qator tushuntirishi** [II qismda](#ii-qism--qatorma-qator-tushuntirish) berilgan.
+
+---
+
+## 4. Kerakli environment'lar (Variables va Secrets)
+
+Workflow'lar ishlashi uchun GitHub'da quyidagi qiymatlar kiritilgan bo'lishi kerak. Ular **Environment** ichida saqlanadi.
+
+### Environment qanday yaratiladi
+
+1. Repo → **Settings** → **Environments** → **New environment**.
+2. Nomini `production` deb yozing (`ci.yml` va `pr-telegram-notify.yml` doim shu nomni ishlatadi).
+3. Ochilgan sahifada **Environment variables** → *Add variable* va **Environment secrets** → *Add secret* orqali quyidagi jadvallardagi nomlarni **aynan shunday** (katta harflarda) kiriting.
+4. `dev` ni ham deploy qilmoqchi bo'lsangiz, `development` nomli ikkinchi environment yarating va o'sha nomlarni unda ham (dev'ga mos qiymatlar bilan) kiriting.
+
+### 4.1 Variables (maxfiy emas, qiymati ko'rinadi)
+
+| Nomi | Nimaga kerak | Qayerda ishlatiladi |
+|---|---|---|
+| `PR_DEV_GROUP_ID` | Xabar yuboriladigan Telegram guruh ID'si (odatda `-100...` bilan boshlanadi) | ci, cd, pr-notify |
+| `PR_TOPIC_ID` | Guruhdagi topic (mavzu) ID'si. Ixtiyoriy, topic bo'lmasa bo'sh qoldiring | ci, cd, pr-notify |
+| `SERVER_HOST` | Deploy qilinadigan server IP manzili yoki domeni | cd |
+| `SERVER_USER` | Serverga SSH orqali kiradigan foydalanuvchi nomi | cd |
+| `DOCKERHUB_USERNAME` | Docker Hub login nomi (image yuborish uchun) | cd |
+| `IMAGE_NAME` | Image to'liq nomi, masalan `username/repo` (teg avtomatik qo'shiladi) | cd |
+| `CONTAINER_NAME` | Serverda ishlaydigan konteyner nomi | cd |
+| `ENV_FILE` | Serverda ilova `.env` fayli saqlanadigan to'liq yo'l, masalan `/home/ubuntu/app/.env` | cd (backend varianti) |
+| `PORT` | Ilova porti. Konteynerga ulanadi, health check (`/healthz`) ham shu portga qaraydi, `.env` ga ham yoziladi | cd (backend varianti) |
+| `VITE_API_URL` | Ilovaga beriladigan API manzili. `.env` ga yoziladi | cd |
+| `DOCKER_NETWORK` | Konteyner ulanadigan Docker tarmog'i. Ixtiyoriy, hozir kodda o'chirilgan | cd (qo'shsangiz) |
+
+### 4.2 Secrets (maxfiy, logda `***` bo'lib chiqadi)
+
+| Nomi | Nimaga kerak | Qayerda ishlatiladi |
+|---|---|---|
+| `PR_TELEGRAM_BOT_TOKEN` | Telegram bot tokeni: bot orqali guruhga xabar yuborish uchun (@BotFather'dan olinadi) | ci, cd, pr-notify |
+| `SSH_PRIVATE_KEY` | Serverga kirish uchun private SSH kalit (`-----BEGIN` dan `-----END` gacha to'liq). Public qismi serverda `authorized_keys` da bo'lishi kerak | cd |
+| `DOCKERHUB_TOKEN` | Docker Hub access token (parol emas): image'ni Docker Hub'ga yuborish uchun | cd |
+
+### 4.3 Kiritish shart emas (GitHub o'zi beradi)
+
+| Nomi | Nimaga kerak |
+|---|---|
+| `GITHUB_TOKEN` (`github.token`) | Skript yiqilgan joblar logini GitHub API'dan o'qishi uchun. Har ishga tushishda avtomatik yaratiladi |
+
+### 4.4 Qiymatlarni qayerdan olish
+
+| Nomi | Qanday olinadi |
+|---|---|
+| `PR_TELEGRAM_BOT_TOKEN` | Telegramda @BotFather → `/newbot` (yoki mavjud bot → *API Token*) |
+| `PR_DEV_GROUP_ID` | Botni guruhga qo'shing, guruhga xabar yozing, so'ng brauzerda `https://api.telegram.org/bot<TOKEN>/getUpdates` ni oching: javobdagi `chat.id` shu (manfiy son) |
+| `PR_TOPIC_ID` | Topic ichiga xabar yozib, xuddi shu `getUpdates` javobidagi `message_thread_id` ni oling |
+| `SSH_PRIVATE_KEY` | Lokalda `ssh-keygen -t ed25519 -f deploy_key -C "github-actions"`. `deploy_key.pub` ichidagini serverdagi `~/.ssh/authorized_keys` ga qo'shing, `deploy_key` (private) faylning **butun matnini** secret'ga qo'ying |
+| `DOCKERHUB_TOKEN` | hub.docker.com → Account settings → Personal access tokens → New token (Read & Write) |
+
+### 4.5 Muhim eslatmalar
+
+- **Hammasi `production` environment'da turishi kerak**, chunki `ci.yml` va `pr-telegram-notify.yml` doim shu nomni ishlatadi. Bo'sh bo'lsa, Telegram xabarlari ketmaydi.
+- **Majburiy tekshiriladiganlar** (bo'sh bo'lsa CD to'xtaydi): `SERVER_HOST`, `SERVER_USER`, `CONTAINER_NAME`, `ENV_FILE`, `PORT`, `IMAGE_NAME`, `VITE_API_URL`.
+- `VITE_API_URL` frontend'dan qolgan nom. Backend uchun ilovangiz haqiqatan kerak qiladigan kalitlarga (`DATABASE_URL`, `JWT_SECRET` kabi) almashtiring va ularni `cd.yml` dagi `Create .env` bosqichiga qo'shing (retsept: [19-bo'lim, 1-retsept](#19-nimani-qayerda-ozgartirish-retseptlar)).
+- **Frontend varianti** `ENV_FILE` va `PORT` ni so'ramaydi: ular `cd.yml` ichida qattiq yozilgan (`/home/ubuntu/zahrodent_admin/.env`, port `8071`). Qolgan nomlar bir xil.
+- Organization'ingiz bo'lsa, Telegram uchta qiymatini (`PR_TELEGRAM_BOT_TOKEN`, `PR_DEV_GROUP_ID`, `PR_TOPIC_ID`) har repoga qayta kiritmasdan **organization darajasida** bir marta kiritish mumkin.
+- Dev va production uchun `CONTAINER_NAME`, `ENV_FILE`, `PORT` qiymatlari **har xil** bo'lsin, aks holda bir-birining konteyneri va `.env` ini bosib yuboradi.
+- Server tomoni: Docker o'rnatilgan, `SERVER_USER` docker'ni `sudo`siz ishlata olishi kerak.
+
+---
+
+## 5. Kundalik ish tartibi
+
+1. Branch ochasiz → kod yozasiz → **PR** ochasiz (shablon avtomatik to'ladi).
+2. Dev guruhiga "🔔 Yangi Pull Request" xabari boradi.
+3. CI ishlaydi: lint, typecheck, test, docker build. Natija Telegramga keladi.
+4. Review va **merge** (`main` ga).
+5. `main` dagi push uchun CI yana ishlaydi → muvaffaqiyatli bo'lsa **CD** avtomatik boshlanadi.
+6. Telegramda "✅ CD passed" kelsa, deploy tayyor.
+
+**Qo'lda deploy:** GitHub → Actions → **CD** → *Run workflow*.
+
+**Qo'lda orqaga qaytish:** serverda `.env.bak` va oldingi image mavjud:
+```bash
+docker run -d --name <CONTAINER> --restart unless-stopped \
+  -p 127.0.0.1:<PORT>:<PORT> --env-file <ENV_FILE> <IMAGE_NAME>:<eski-sha>
+```
+
+---
+
+## 6. Lokal sinash
+
+PR xabari ko'rinishini Telegramga yubormasdan ko'rish:
+
+```bash
+DRY_RUN=1 \
+PR_TITLE="feat: yangi sahifa" \
+PR_AUTHOR="ali" \
+PR_NUMBER=42 \
+PR_URL="https://github.com/org/repo/pull/42" \
+BASE_BRANCH=main HEAD_BRANCH=feat/page REPO_NAME=org/repo \
+PR_BODY="$(cat .github/pull_request_template.md)" \
+python3 .github/script/notify-pr-telegram.py
+```
+
+Workflow sintaksisini tekshirish uchun [`actionlint`](https://github.com/rhysd/actionlint), bash skriptini `shellcheck` bilan tekshirish mumkin.
+
+---
+
+## 7. Xavfsizlik qoidalari
+
+- **Script injection'dan himoya.** `run:` ichiga `${{ ... }}` to'g'ridan-to'g'ri yozilmaydi. Hamma qiymat `env:` orqali beriladi (commit xabari, PR sarlavhasi kabi foydalanuvchi matnlari shell buyrug'iga aylanib ketmasligi uchun).
+- **Minimal huquqlar.** `permissions: contents: read`. Faqat kerakli joyda `actions: read` qo'shiladi.
+- **Fayl huquqlari.** `.env` `umask 077` bilan yaratiladi, SSH kalit `chmod 600`.
+- **Secret'lar logga chiqmaydi.** Telegram javobida token bo'lmaydi, shuning uchun xato matnini chop etish xavfsiz.
+- **Image skaneri.** Trivy tuzatilgan CRITICAL zaiflikni o'tkazmaydi.
+- **Port yopiq.** Konteyner `127.0.0.1` ga bog'lanadi, tashqaridan to'g'ridan-to'g'ri ochilmaydi.
+- **Dependabot.** Unga secret berilmaydi, skriptlar bunga moslashgan (xabarni jim o'tkazib yuboradi).
+
+---
+
+## 8. Yangi loyihaga ko'chirish
+
+1. `.github/` papkasini repo ildiziga nusxalang.
+2. `ci.yml` dagi buyruqlarni (`eslint`, `tsc`, `npm test`, Node versiyasi) loyihangizga moslang. Kerak bo'lmagan jobni olib tashlang, `notify` dagi `needs` va env o'zgaruvchilarini ham.
+3. `dependabot.yml` da `package-ecosystem` ni moslang (`pip`, `gomod`, `maven` va h.k.).
+4. Repo'da `Dockerfile` bo'lsin.
+5. Environment yarating va [4-bo'limdagi](#4-kerakli-environmentlar-variables-va-secrets) variable va secret'larni kiriting.
+6. `cd.yml` dagi `Create .env` ro'yxatini ilova kalitlariga moslang.
+7. Ilovada `GET /healthz` endpoint qo'shing (200 qaytarsin).
+8. Branch himoyasi: `main` ga faqat PR orqali va CI yashil bo'lsa merge qilishga ruxsat bering.
+9. Sinash: kichik PR oching → Telegramga xabar keladimi → merge qiling → CD ishlaydimi.
+
+---
+
+## 9. Muammolarni hal qilish
+
+| Belgi | Ehtimoliy sabab | Yechim |
+|---|---|---|
+| CD umuman ishga tushmadi | CI qizil, yoki push `main` ga emas | Avval CI'ni tuzating; Actions'da CI natijasini tekshiring |
+| `environment'da yo'q: ...` | Variable kiritilmagan | [4-bo'limdagi](#4-kerakli-environmentlar-variables-va-secrets) jadvaldan shu nomni Settings → Environments da qo'shing |
+| `Permission denied (publickey)` | SSH kalit noto'g'ri | Secret'ni to'liq (`BEGIN`…`END`) kiriting, public key serverda borligini tekshiring |
+| Har deploy rollback bilan tugaydi | `/healthz` yo'q yoki `PORT` noto'g'ri | Endpoint qo'shing, `PORT` ilova porti bilan bir xil bo'lsin |
+| Trivy deploy'ni to'xtatdi | Tuzatilgan CRITICAL zaiflik | Base image yoki paketni yangilang |
+| Telegram xabari kelmadi | Token/Chat ID noto'g'ri, bot guruhda yo'q | Botni guruhga qo'shing, `PR_DEV_GROUP_ID` va `PR_TOPIC_ID` ni tekshiring (guruh ID odatda `-100...` bilan boshlanadi) |
+| `Telegram sendMessage failed (HTTP 400)` | HTML teg buzilgan yoki topic ID noto'g'ri | Javob matniga qarang, `PR_TOPIC_ID` ni tekshiring |
+| Dependabot PR'da Telegram jim | Mo'ljallangan xatti-harakat | Dependabot secret olmaydi |
+| `docker pull` serverda yiqildi | Docker Hub login/tokeni yoki image nomi xato | `IMAGE_NAME` va tegni tekshiring; image private bo'lsa serverda login kerak |
+| Telegramda xato matni chiqmaydi | `notify` da `GH_TOKEN`, `RUN_ID`, `actions: read` yo'q, yoki job `name:` lari skript kutgan nomlarga mos emas | `notify` jobini namunadagidek qoldiring, job nomlarini (`Lint`, `Test`, `Deploy`...) o'zgartirmang |
+
+---
+
+## 10. Ma'lum cheklovlar
+
+- **Faqat `main` deploy bo'ladi.** `cd.yml` `branches: [main]` bilan cheklangan. `dev` ni ham deploy qilish uchun `branches` ga `dev` qo'shing va ajratilgan `CONTAINER_NAME`, `ENV_FILE` va `PORT` qiymatlarini `development` environment'ga kiriting. Aks holda ikki muhit bir-birining konteyneri va `.env` ini bosib yuboradi.
+- **Bitta `concurrency` guruhi** (`deploy-production`): barcha deploy'lar navbat bilan ketadi.
+- **`ci.yml` buyruqlari frontend uslubida** (`src`, `tsconfig.app.json`). Backend uchun o'zingizning lint, test va build buyruqlaringizni qo'ying.
+- **`VITE_API_URL`** `Create .env` ro'yxatida frontend'dan qolgan nom. Backend uchun haqiqiy kalitlar (`DATABASE_URL`, `JWT_SECRET` kabi) bilan almashtirilishi kerak.
+- **PR shablon va skript nomuvofiqligi.** Skript `skrinshot` so'zini qidiradi, shablonda `Screenshot` yozilgan, shuning uchun u oddiy ▪️ belgisini oladi. Shuningdek, "Turi" katakchalari "Tekshiruv ro'yxati" hisobiga kiradi.
+- **Rollback faqat deploy bosqichida ishlaydi.** Ma'lumotlar bazasi migratsiyalari avtomatik qaytarilmaydi.
+
+---
+
+# II qism — Qatorma-qator tushuntirish
+
+Qator raqamlari ZIP'dagi fayllarga mos (`cd.yml` va `notify-telegram.sh` uchun **backend varianti** olingan).
+
+---
+
+## 11. Avval shularni bilib oling (lug'at)
 
 ### GitHub Actions tuzilishi
 
@@ -111,7 +415,7 @@ Hamma fayllarda shu qoidaga amal qilingan.
 
 ---
 
-## 1. `dependabot.yml`
+## 12. `dependabot.yml`
 
 Dependabot — GitHub'ning o'z boti. Eskirgan kutubxonalarni topib, yangilash uchun **o'zi PR ochadi**.
 
@@ -154,7 +458,7 @@ Xuddi shu, lekin `.github/workflows/` dagi action versiyalari (`actions/checkout
 
 ---
 
-## 2. `pull_request_template.md`
+## 13. `pull_request_template.md`
 
 PR ochilganda tavsif maydoni shu matn bilan avtomatik to'ladi. Oddiy Markdown.
 
@@ -167,11 +471,11 @@ PR ochilganda tavsif maydoni shu matn bilan avtomatik to'ladi. Oddiy Markdown.
 | 13-17 | `## Tekshiruv` ro'yxati | Dasturchi o'zini tekshiradi |
 | 19 | `## Screenshot (UI bo'lsa)` | Rasm qo'yish uchun joy |
 
-**Eslatma:** `notify-pr-telegram.py` sarlavha matniga qarab emoji tanlaydi (7-bo'limda). Sarlavhalarni o'zgartirsangiz, skriptdagi `HEADING_ICONS` ro'yxatini ham moslang.
+**Eslatma:** `notify-pr-telegram.py` sarlavha matniga qarab emoji tanlaydi (18-bo'limda). Sarlavhalarni o'zgartirsangiz, skriptdagi `HEADING_ICONS` ro'yxatini ham moslang.
 
 ---
 
-## 3. `workflows/ci.yml`
+## 14. `workflows/ci.yml`
 
 **Vazifasi:** kod buzilmaganini tekshirish (Continuous Integration).
 
@@ -348,11 +652,11 @@ Skriptni ishga tushiradi.
 
 ---
 
-## 4. `workflows/cd.yml`
+## 15. `workflows/cd.yml`
 
 **Vazifasi:** CI muvaffaqiyatli tugagach, image yig'ish, serverga joylash va tekshirish (Continuous Deployment).
 
-### 4.1 Sarlavha, trigger, umumiy sozlamalar (1-22)
+### 15.1 Sarlavha, trigger, umumiy sozlamalar (1-22)
 
 ```yaml
 8  on:
@@ -364,7 +668,7 @@ Skriptni ishga tushiradi.
 ```
 - 9-12: `CI` workflow'i **tugagach** (`completed`, natijasi qanday bo'lishidan qat'i nazar) va **`main`** branch'da bo'lsa ishga tushadi. (Natijani keyin `build` jobidagi `if` tekshiradi.)
 - 13: qo'lda ishga tushirish tugmasi.
-- **Dev'ni ham deploy qilish:** 12-qatorni `branches: [main, dev]` qiling (8-bo'limdagi 3-retseptga qarang).
+- **Dev'ni ham deploy qilish:** 12-qatorni `branches: [main, dev]` qiling (19-bo'limdagi 3-retseptga qarang).
 
 ```yaml
 15 concurrency:
@@ -379,7 +683,7 @@ Bir vaqtda faqat bitta deploy. Yangisi kelsa **navbat kutadi, bekor qilinmaydi**
 ```
 Faqat kodni o'qish.
 
-### 4.2 Job `build` (23-91)
+### 15.2 Job `build` (23-91)
 
 ```yaml
 24    name: Build
@@ -502,7 +806,7 @@ Zaifliklar skaneri (Trivy), Docker konteyneri ichida ishlatiladi.
 - 89: image'ga ikkinchi nom (`latest`) beradi.
 - 90-91: ikkalasini Docker Hub'ga yuboradi. Serverda aniq versiya (`:sha`) ishlatiladi, `latest` esa qulaylik uchun.
 
-### 4.3 Job `prepare` (93-152)
+### 15.3 Job `prepare` (93-152)
 
 ```yaml
 94    name: Prepare
@@ -545,7 +849,7 @@ Ilovaning `.env` faylini yasaydi.
 - 127-129: ro'yxatdagi har kalit uchun `KALIT=qiymat` qatorini `app.env` ga yozadi.
 - 130: nechta kalit yozilganini ko'rsatadi (`wc -l` = qatorlar soni).
 
-**Yangi `.env` kaliti qo'shish uchun 3 joyni o'zgartiring:** 114-116 (qadam `env`), 120 va 127 (`for k in ...` ikkala ro'yxat) va environment'da variable/secret yarating. (Secret bo'lsa `${{ secrets.NOM }}`.) Namuna: 8-bo'lim, 1-retsept.
+**Yangi `.env` kaliti qo'shish uchun 3 joyni o'zgartiring:** 114-116 (qadam `env`), 120 va 127 (`for k in ...` ikkala ro'yxat) va environment'da variable/secret yarating. (Secret bo'lsa `${{ secrets.NOM }}`.) Namuna: 19-bo'lim, 1-retsept.
 
 ```yaml
 132     - name: Setup SSH
@@ -585,7 +889,7 @@ Runner'dan serverga SSH ulanishni tayyorlaydi.
 ```
 Serverda yangi image'ni Docker Hub'dan tortadi (deploy tez bo'lishi uchun oldindan).
 
-### 4.4 Job `deploy` (154-220)
+### 15.4 Job `deploy` (154-220)
 
 98-107 kabi `environment` va `env` (bu yerda `PORT` job darajasida, 169-qator). `needs: prepare`.
 
@@ -600,7 +904,7 @@ Serverda yangi image'ni Docker Hub'dan tortadi (deploy tez bo'lishi uchun oldind
 Serverga ulanib, quyidagi (`EOF` gacha) **skriptni serverda bajaradi**.
 - `IMAGE='...' CONTAINER='...' ... bash -s` = o'zgaruvchilarni berib, `bash` ni stdin'dan skript o'qiydigan rejimda (`-s`) ishga tushiradi.
 - `<< 'EOF'` ... `EOF` = "heredoc": orasidagi matn skript bo'lib uzatiladi. `'EOF'` qo'shtirnoqda bo'lgani uchun matn **runner'da o'zgartirilmaydi** (hamma `$` serverda ochiladi).
-- `${NETWORK:-}`: `NETWORK` hech qayerda e'lon qilinmagan, shuning uchun bo'sh; ya'ni Docker network ishlatilmaydi (kerak bo'lsa 8-bo'lim, 4-retsept).
+- `${NETWORK:-}`: `NETWORK` hech qayerda e'lon qilinmagan, shuning uchun bo'sh; ya'ni Docker network ishlatilmaydi (kerak bo'lsa 19-bo'lim, 4-retsept).
 
 Endi serverda bajariladigan skript (190-216):
 
@@ -671,7 +975,7 @@ Heredoc tugashi. YAML bu qatordan ortiqcha bo'shliqlarni olib tashlaydi, shuning
 ```
 Serverdan ishlatilmayotgan va **7 kundan (168 soat)** eski image'larni o'chiradi: disk to'lib ketmasligi uchun. `|| true`: xato bo'lsa ham deploy qizil bo'lmasin. (Birinchi zipdagi bot varianti `docker image prune -f` ishlatgan.)
 
-### 4.5 Job `notify` (222-253)
+### 15.5 Job `notify` (222-253)
 
 ```yaml
 227    needs: [build, prepare, deploy]
@@ -711,7 +1015,7 @@ Uch jobni kutadi. `always()` = ular yiqilsa ham ishlaydi. Qo'shimcha shart: `bui
 
 ---
 
-## 5. `workflows/pr-telegram-notify.yml`
+## 16. `workflows/pr-telegram-notify.yml`
 
 Yangi PR ochilganda Telegramga xabar yuboradi.
 
@@ -766,7 +1070,7 @@ Hamma qiymat PR ma'lumotlaridan `env` orqali Python skriptiga beriladi (`PR_TITL
 
 ---
 
-## 6. `script/notify-telegram.sh`
+## 17. `script/notify-telegram.sh`
 
 `ci.yml` va `cd.yml` ning `notify` joblari chaqiradigan bash skripti. Natijani yig'ib Telegramga yuboradi.
 
@@ -997,7 +1301,7 @@ Telegram API'ga POST so'rov.
 
 ---
 
-## 7. `script/notify-pr-telegram.py`
+## 18. `script/notify-pr-telegram.py`
 
 Yangi PR xabarini yuboradi va PR tavsifini (Markdown) Telegram HTML'iga o'giradi. Faqat standart kutubxonalar kerak.
 
@@ -1246,7 +1550,7 @@ Fayl to'g'ridan-to'g'ri ishga tushirilganda `main()` chaqiriladi.
 
 ---
 
-## 8. Nimani qayerda o'zgartirish (retseptlar)
+## 19. Nimani qayerda o'zgartirish (retseptlar)
 
 ### 1) `.env` ga yangi kalit qo'shish (masalan `DATABASE_URL`, secret)
 1. GitHub → Environments → `production` → Secret: `DATABASE_URL`.
@@ -1297,16 +1601,3 @@ Yangi job yarating (`name: Migrate`), `notify.needs` ga qo'shing va `env:` ga `M
 
 ### 14) PR xabari faqat ochilganda emas, qayta ochilganda ham
 `pr-telegram-notify.yml` 5-qator: `types: [opened, reopened]`.
-
----
-
-### Eng ko'p uchraydigan xatolar (tezkor jadval)
-
-| Xato | Sabab |
-|---|---|
-| CD ishga tushmadi | CI qizil, yoki push `main` ga emas, yoki `ci.yml` nomi `CI` emas |
-| `environment'da yo'q: ...` | Variable kiritilmagan (47 yoki 120-qatordagi ro'yxatda bor) |
-| `Permission denied (publickey)` | `SSH_PRIVATE_KEY` to'liq emas yoki public key serverda yo'q |
-| Har deploy rollback bilan tugaydi | `/healthz` yo'q yoki `PORT` ilova portiga mos emas |
-| Telegramda xato matni chiqmaydi | `notify` da `GH_TOKEN`, `RUN_ID`, `actions: read` yo'q, yoki job `name:` lari skript kutgan nomlarga mos emas |
-| Telegram `HTTP 400` | HTML teg buzilgan, `PR_TOPIC_ID` noto'g'ri yoki `CHAT_ID` xato |
